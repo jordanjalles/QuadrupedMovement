@@ -5,6 +5,7 @@ using Unity.MLAgents;
 using Unity.MLAgents.Sensors;
 
 
+
 public class AdvancedQuadrupedAgent : Agent
 {
 
@@ -12,25 +13,42 @@ public class AdvancedQuadrupedAgent : Agent
     public float positionSpringPower = 100;
     public float maxSpringForce = 200;
     private float initialMaxSpringForce;
+
     public Transform[] limbs;
-    public float minUpVectorDot;
     public Transform chest;
     Rigidbody rBody;
+
+    public float minUpVectorDot;
     public float distanceToTouchTarget = 1f;
     public float targetDistanceRange = 18f;
+
+    public enum RewardMode {SeekTarget, StandUp};
+    public RewardMode rewardMode;
+    
     public bool immortal = false;
+    
     public bool randomizeMaxSpringForce = false;
     public bool randomizeLegScales = false;
+    
     public float frontScale = 0.75f;
     public float backScale = 0.75f;
+    
     private float efficiencyRollingAverage = 0;
     private float efficiencyRollingAverageDepth = 10; 
+    
     private Vector3 velocityRollingAverage = Vector3.zero;
     private float velocityRollingAverageDepth = 20;
+    
     private bool touchGroundOtherThanFeet = false;
+    
+    private float forceUsedPercent = 0;
+
+    public bool stateBasedModelSwitching = false;
+
+    public Unity.Barracuda.NNModel seekTargetModel; 
+    public Unity.Barracuda.NNModel standUpModel;
 
 
-    // Start is called before the first frame update
     void Start()
     {
         rBody = GetComponent<Rigidbody>();
@@ -41,9 +59,36 @@ public class AdvancedQuadrupedAgent : Agent
             ConfigurableJoint cJoint = limbs[i].GetComponent<ConfigurableJoint>();
             SetJointDriveMaximumForce(cJoint, maxSpringForce);
         }
+    }
 
-        float previousDistanceToTarget = Vector3.Distance(this.transform.localPosition, target.localPosition);
-
+    private void Update()
+    {
+        
+        if (stateBasedModelSwitching)
+        {
+            
+            if (rewardMode == RewardMode.StandUp)
+            {
+                DrawRedGreen(-0.2f);
+                if (FallenDownConditions() == false)
+                {
+                    
+                    rewardMode = RewardMode.SeekTarget;
+                    this.SetModel("AdvancedQuadrupedBehavior", seekTargetModel);
+                    
+                }
+            }else if (rewardMode == RewardMode.SeekTarget)
+            {
+                DrawRedGreen(0f);
+                if (FallenDownConditions() == true)
+                {
+                    
+                    rewardMode = RewardMode.StandUp;
+                    this.SetModel("AdvancedQuadrupedBehavior", standUpModel);
+                    
+                }
+            }
+        }
     }
 
     //Used to reset a training scenario
@@ -52,20 +97,7 @@ public class AdvancedQuadrupedAgent : Agent
     //etc...
     public override void OnEpisodeBegin()
     {
-        RandomizeTargetLocation();
-        while (DistanceToTarget() < distanceToTouchTarget * 3)
-        {
-            RandomizeTargetLocation();
-        }
-
-        if (DeathConditions())
-        {
-            this.rBody.transform.rotation = Quaternion.identity;
-            this.rBody.velocity = Vector3.zero;
-            this.rBody.angularVelocity = Vector3.zero;
-            this.transform.localPosition = new Vector3(0, 0.07f, 0);
-            this.rBody.transform.Rotate(new Vector3(0, Random.value * 360, 0));
-        }
+        SetUpTrainingMode();
 
         if (randomizeMaxSpringForce)
         {
@@ -73,6 +105,7 @@ public class AdvancedQuadrupedAgent : Agent
             //Debug.Log(this.maxSpringForce / this.initialMaxSpringForce);
         }
 
+        //todo...make this work properly
         if (randomizeLegScales)
         {
             Transform backRight = limbs[0].transform.parent;
@@ -89,8 +122,51 @@ public class AdvancedQuadrupedAgent : Agent
             ResizeLimbParent(backLeft, backScale);
             ResizeLimbParent(frontRight, frontScale);
             ResizeLimbParent(frontLeft, frontScale);
-
         }
+    }
+
+
+    private void SetUpTrainingMode()
+    {
+        if (rewardMode == RewardMode.StandUp)
+        {
+            if (target.gameObject.activeSelf)
+            {
+                target.gameObject.SetActive(false);
+            }
+            ResetLocation();
+            //flip around to random rotation
+            this.rBody.transform.Rotate(new Vector3(90 + RandomGaussian() * 180, Random.value * 360, 0f));
+        }
+
+        if (rewardMode == RewardMode.SeekTarget)
+        {
+            if (!target.gameObject.activeSelf)
+            {
+                target.gameObject.SetActive(true);
+            }
+
+            if (FallenDownConditions())
+            {
+                ResetLocation();
+                //face random direction
+                this.rBody.transform.Rotate(new Vector3(0, Random.value * 360, 0));
+            }
+
+            while (DistanceToTarget() < distanceToTouchTarget * 3)
+            {
+                RandomizeTargetLocation();
+            }
+        }
+
+    }
+
+    private void ResetLocation()
+    {
+        this.transform.localPosition = new Vector3(0, 0.07f, 0);
+        this.rBody.transform.rotation = Quaternion.identity;
+        this.rBody.velocity = Vector3.zero;
+        this.rBody.angularVelocity = Vector3.zero;
     }
 
     private void ResizeLimbParent(Transform limbParent, float newScale)
@@ -115,7 +191,7 @@ public class AdvancedQuadrupedAgent : Agent
         target.localPosition = new Vector3(Random.value * targetDistanceRange - targetDistanceRange/2, 0, Random.value * targetDistanceRange - targetDistanceRange/2);
     }
 
-    private bool DeathConditions()
+    private bool FallenDownConditions()
     {
         return (touchGroundOtherThanFeet || Vector3.Dot(this.transform.up, Vector3.up) < minUpVectorDot || chest.GetComponent<TouchingGround>().touching);
     }
@@ -123,7 +199,6 @@ public class AdvancedQuadrupedAgent : Agent
     //total observation size 32
     public override void CollectObservations(VectorSensor sensor)
     {
-        
         
         //target position vec3
         sensor.AddObservation(this.transform.InverseTransformPoint(target.position).normalized);
@@ -167,8 +242,9 @@ public class AdvancedQuadrupedAgent : Agent
         Vector3 controlSignal = Vector3.zero;
         float minRotation;
         float maxRotation;
-        float forceUsedPercent = 0f;
-        touchGroundOtherThanFeet = false;
+
+        this.forceUsedPercent = 0f;
+        this.touchGroundOtherThanFeet = false;
 
         for (int i = 0; i < limbs.Length; i++) {
             ConfigurableJoint cJoint = limbs[i].GetComponent<ConfigurableJoint>();
@@ -199,8 +275,38 @@ public class AdvancedQuadrupedAgent : Agent
             cJoint.targetRotation = Quaternion.Euler(controlSignal);
         }
 
+        if (rewardMode == RewardMode.SeekTarget)
+        {
+            SeekTargetReward();
+        }
 
-        if (DeathConditions())
+        if (rewardMode == RewardMode.StandUp)
+        {
+            StandUpReward();
+        }
+    }
+
+    private void StandUpReward()
+    {
+
+        if (FallenDownConditions() == false)
+        {
+            AddReward(10f);
+            if (!immortal)
+            {
+                EndEpisode();
+            }
+        }
+
+        float reward = 0.0f;
+        float upVectorSignal = Mathf.InverseLerp(-1, 1, (Vector3.Dot(this.transform.up, Vector3.up))) * 0.2f;
+        reward += Mathf.Pow(upVectorSignal, 4);
+        AddReward(reward);
+    }
+
+    private void SeekTargetReward() {
+
+        if (FallenDownConditions())
         {            
             SetReward(-1.0f);
             if (!immortal)
@@ -214,11 +320,8 @@ public class AdvancedQuadrupedAgent : Agent
         //Debug.Log("e:" + efficiency + " era" + efficiencyRollingAverage.ToString());
 
         velocityRollingAverage = (velocityRollingAverage + (rBody.velocity / velocityRollingAverageDepth)) / (1 + 1f / velocityRollingAverageDepth);
-        //Debug.Log("v:" + rBody.velocity.ToString() + "vra" + velocityRollingAverage.ToString());
-        float velocityDelta = (velocityRollingAverage - rBody.velocity).magnitude;
-        float movementSmoothness = 1 - (float)System.Math.Tanh(velocityDelta*2f);
-        //DrawRedGreen(movementSmoothness*2-1);
-        //Debug.Log("ms: " + movementSmoothness.ToString());
+        float velocityDeltaFromAverage = (velocityRollingAverage - rBody.velocity).magnitude;
+        float movementSmoothness = 1 - (float)System.Math.Tanh(velocityDeltaFromAverage*2f);
 
 
         //0 is away from target, 1 is towards target
@@ -228,14 +331,9 @@ public class AdvancedQuadrupedAgent : Agent
         float velocityTowardsTarget = rBody.velocity.magnitude*Vector3.Dot(rBody.velocity.normalized, (target.position - this.transform.position).normalized);
         //velocity towards target limit 1
         float vttl1 = Mathf.Max((float)System.Math.Tanh(velocityTowardsTarget*0.5f), 0);
-        //Debug.Log("vttl1: " + vttl1.ToString());
-        //DrawRedGreen(vttl1);
+
 
         float levelHorizon =  Mathf.InverseLerp(minUpVectorDot, 1f, Vector3.Dot(this.transform.up, Vector3.up));
-        
-        //DrawRedGreen(levelHorizon*2-1);
-        //Debug.Log(levelHorizon);
-
 
 
         float reward = 1;
@@ -246,16 +344,12 @@ public class AdvancedQuadrupedAgent : Agent
         //reward *= movementSmoothness;
         //reward *= levelHorizon;
 
-        DrawRedGreen(vttl1);
-        Debug.Log("vttl1: " + vttl1);
+        //DrawRedGreen(vttl1);
+        //Debug.Log("vttl1: " + vttl1);
 
 
         AddReward(reward); //reward for moving towards goal
         //Debug.Log("reward:" + reward);
-        
-
-
-
 
         //Debug.Log(distanceToTarget);
         if (DistanceToTarget() < distanceToTouchTarget)
@@ -263,8 +357,6 @@ public class AdvancedQuadrupedAgent : Agent
             SetReward(1.0f);
             EndEpisode();
         }
-
-
     }
 
     private float DistanceToTarget()
@@ -312,21 +404,6 @@ public class AdvancedQuadrupedAgent : Agent
             float h = Mathf.InverseLerp(-1, 1, Input.GetAxis("Vertical"));
             //actionsOut[i] = (i % 2 == 0) ? v : h;
         }
-    }
-
-    private float limit1(float number, float halfWayMark)
-    {
-        return 1 - (1 / (number / halfWayMark + 1));
-    }
-
-    private float limit1(float number)
-    {
-        return limit1(number, 0.5f);
-    }
-
-    public float GetComplacency()
-    {
-        return  Mathf.Pow(1 - (limit1(rBody.velocity.magnitude, 0.25f)), 2);
     }
 
     public float GetFacingTarget()
